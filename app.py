@@ -75,7 +75,7 @@ class Database:
     def create_post(self, user_id: int, content: str) -> int:
         result = self._query("""
             MATCH (u:User {id: $user_id})
-            MATCH (p:Post)
+            OPTIONAL MATCH (p:Post)
             WITH u, COALESCE(MAX(p.id), 0) + 1 AS new_post_id
             CREATE (new_post:Post {
                 id: new_post_id,

@@ -1,151 +1,160 @@
 # social_network.py
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session
-import sqlite3
-from dataclasses import dataclass
+from neo4j import GraphDatabase
 from typing import List, Optional
+import os
 
 # ======================
 # Database Access Layer
 # ======================
 class Database:
-    def __init__(self, db_name='social_network.db'):
-        self.db_name = db_name
+    def __init__(self):
+        self.uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self.username = os.getenv("NEO4J_USERNAME", "neo4j")
+        self.password = os.getenv("NEO4J_PASSWORD", "password")
+        self.database = os.getenv("NEO4J_DATABASE", "neo4j")
+
+        self.driver = GraphDatabase.driver(
+            self.uri,
+            auth=(self.username, self.password)
+        )
+        self.driver.verify_connectivity()
         self._init_db()
-    
+
+    def _query(self, query: str, **params):
+        records, _, _ = self.driver.execute_query(
+            query,
+            parameters_=params,
+            database_=self.database,
+        )
+        return [record.data() for record in records]
+
     def _init_db(self):
-        with self._get_connection() as conn:
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    username TEXT UNIQUE NOT NULL,
-                    name TEXT NOT NULL
-                )
-            ''')
-            
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS posts (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    user_id INTEGER NOT NULL,
-                    content TEXT NOT NULL,
-                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY(user_id) REFERENCES users(id)
-                )
-            ''')
-            
-            conn.execute('''
-                CREATE TABLE IF NOT EXISTS followers (
-                    follower_id INTEGER NOT NULL,
-                    followee_id INTEGER NOT NULL,
-                    PRIMARY KEY(follower_id, followee_id),
-                    FOREIGN KEY(follower_id) REFERENCES users(id),
-                    FOREIGN KEY(followee_id) REFERENCES users(id)
-                )
-            ''')
-    
-    def _get_connection(self):
-        return sqlite3.connect(self.db_name)
-    
+        self._query("""
+            CREATE CONSTRAINT unique_user_id IF NOT EXISTS
+            FOR (u:User) REQUIRE u.id IS UNIQUE
+        """)
+        self._query("""
+            CREATE CONSTRAINT unique_username IF NOT EXISTS
+            FOR (u:User) REQUIRE u.username IS UNIQUE
+        """)
+        self._query("""
+            CREATE CONSTRAINT unique_post_id IF NOT EXISTS
+            FOR (p:Post) REQUIRE p.id IS UNIQUE
+        """)
+
     # User operations
     def create_user(self, username: str, name: str) -> int:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO users (username, name) VALUES (?, ?)', (username, name))
-            return cursor.lastrowid
-    
+        result = self._query("""
+            MATCH (u:User)
+            WITH COALESCE(MAX(u.id), 0) + 1 AS new_id
+            CREATE (new_user:User {
+                id: new_id,
+                username: $username,
+                name: $name
+            })
+            RETURN new_user.id AS id
+        """, username=username, name=name)
+        return result[0]["id"]
+
     def get_user(self, user_id: int) -> Optional[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, username, name FROM users WHERE id = ?', (user_id,))
-            row = cursor.fetchone()
-            return {'id': row[0], 'username': row[1], 'name': row[2]} if row else None
-    
+        result = self._query("""
+            MATCH (u:User {id: $user_id})
+            RETURN u.id AS id, u.username AS username, u.name AS name
+        """, user_id=user_id)
+        return result[0] if result else None
+
     def get_all_users(self) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('SELECT id, username, name FROM users')
-            return [{'id': row[0], 'username': row[1], 'name': row[2]} for row in cursor.fetchall()]
-    
+        return self._query("""
+            MATCH (u:User)
+            RETURN u.id AS id, u.username AS username, u.name AS name
+            ORDER BY u.id
+        """)
+
     # Post operations
     def create_post(self, user_id: int, content: str) -> int:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('INSERT INTO posts (user_id, content) VALUES (?, ?)', (user_id, content))
-            return cursor.lastrowid
-    
+        result = self._query("""
+            MATCH (u:User {id: $user_id})
+            MATCH (p:Post)
+            WITH u, COALESCE(MAX(p.id), 0) + 1 AS new_post_id
+            CREATE (new_post:Post {
+                id: new_post_id,
+                content: $content,
+                timestamp: datetime()
+            })
+            CREATE (u)-[:POSTED]->(new_post)
+            RETURN new_post.id AS id
+        """, user_id=user_id, content=content)
+        return result[0]["id"]
+
     def get_posts_by_user(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT p.id, p.content, p.timestamp, u.username, u.name 
-                FROM posts p JOIN users u ON p.user_id = u.id 
-                WHERE p.user_id = ?
-                ORDER BY p.timestamp DESC
-            ''', (user_id,))
-            return [{
-                'id': row[0],
-                'content': row[1],
-                'timestamp': row[2],
-                'username': row[3],
-                'name': row[4]
-            } for row in cursor.fetchall()]
-    
+        return self._query("""
+            MATCH (u:User {id: $user_id})-[:POSTED]->(p:Post)
+            RETURN
+                p.id AS id,
+                p.content AS content,
+                toString(p.timestamp) AS timestamp,
+                u.username AS username,
+                u.name AS name
+            ORDER BY p.timestamp DESC
+        """, user_id=user_id)
+
     def get_feed(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT p.id, p.content, p.timestamp, u.username, u.name 
-                FROM posts p 
-                JOIN users u ON p.user_id = u.id
-                JOIN followers f ON p.user_id = f.followee_id
-                WHERE f.follower_id = ?
-                ORDER BY p.timestamp DESC
-            ''', (user_id,))
-            return [{
-                'id': row[0],
-                'content': row[1],
-                'timestamp': row[2],
-                'username': row[3],
-                'name': row[4]
-            } for row in cursor.fetchall()]
-    
+        return self._query("""
+            MATCH (:User {id: $user_id})-[:FOLLOWS]->(followed:User)-[:POSTED]->(p:Post)
+            RETURN
+                p.id AS id,
+                p.content AS content,
+                toString(p.timestamp) AS timestamp,
+                followed.username AS username,
+                followed.name AS name
+            ORDER BY p.timestamp DESC
+        """, user_id=user_id)
+
     # Follow operations
     def follow_user(self, follower_id: int, followee_id: int) -> bool:
-        with self._get_connection() as conn:
-            try:
-                conn.execute('INSERT INTO followers (follower_id, followee_id) VALUES (?, ?)', 
-                           (follower_id, followee_id))
-                return True
-            except sqlite3.IntegrityError:
-                return False
-    
+        if follower_id == followee_id:
+            return False
+
+        existing = self._query("""
+            MATCH (:User {id: $follower_id})-[r:FOLLOWS]->(:User {id: $followee_id})
+            RETURN COUNT(r) AS count
+        """, follower_id=follower_id, followee_id=followee_id)
+
+        if existing[0]["count"] > 0:
+            return False
+
+        created = self._query("""
+            MATCH (follower:User {id: $follower_id})
+            MATCH (followee:User {id: $followee_id})
+            CREATE (follower)-[:FOLLOWS {created_at: datetime()}]->(followee)
+            RETURN true AS success
+        """, follower_id=follower_id, followee_id=followee_id)
+
+        return bool(created and created[0]["success"])
+
     def get_followers(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT u.id, u.username, u.name 
-                FROM followers f 
-                JOIN users u ON f.follower_id = u.id
-                WHERE f.followee_id = ?
-            ''', (user_id,))
-            return [{'id': row[0], 'username': row[1], 'name': row[2]} for row in cursor.fetchall()]
-    
+        return self._query("""
+            MATCH (follower:User)-[:FOLLOWS]->(:User {id: $user_id})
+            RETURN follower.id AS id, follower.username AS username, follower.name AS name
+            ORDER BY follower.username
+        """, user_id=user_id)
+
     def get_following(self, user_id: int) -> List[dict]:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('''
-                SELECT u.id, u.username, u.name 
-                FROM followers f 
-                JOIN users u ON f.followee_id = u.id
-                WHERE f.follower_id = ?
-            ''', (user_id,))
-            return [{'id': row[0], 'username': row[1], 'name': row[2]} for row in cursor.fetchall()]
+        return self._query("""
+            MATCH (:User {id: $user_id})-[:FOLLOWS]->(followed:User)
+            RETURN followed.id AS id, followed.username AS username, followed.name AS name
+            ORDER BY followed.username
+        """, user_id=user_id)
 
     def unfollow_user(self, follower_id: int, followee_id: int) -> bool:
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM followers WHERE follower_id = ? AND followee_id = ?', 
-                        (follower_id, followee_id))
-            return cursor.rowcount > 0
+        result = self._query("""
+            MATCH (:User {id: $follower_id})-[r:FOLLOWS]->(:User {id: $followee_id})
+            WITH COLLECT(r) AS rels
+            FOREACH (rel IN rels | DELETE rel)
+            RETURN SIZE(rels) > 0 AS success
+        """, follower_id=follower_id, followee_id=followee_id)
+        return bool(result and result[0]["success"])
 
 # ======================
 # Web Application
@@ -156,11 +165,15 @@ db = Database()
 
 # Sample data initialization
 with app.app_context():
-    # Create some sample users if they don't exist
     if not db.get_all_users():
-        db.create_user('alice', 'Alice Smith')
-        db.create_user('bob', 'Bob Johnson')
-        db.create_user('charlie', 'Charlie Brown')
+        alice_id = db.create_user('alice', 'Alice Smith')
+        bob_id = db.create_user('bob', 'Bob Johnson')
+        charlie_id = db.create_user('charlie', 'Charlie Brown')
+
+        db.follow_user(alice_id, bob_id)
+        db.follow_user(alice_id, charlie_id)
+        db.create_post(bob_id, 'Hello from Bob!')
+        db.create_post(charlie_id, 'Charlie checking in.')
 
 # ======================
 # API Endpoints
